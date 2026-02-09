@@ -1,5 +1,6 @@
 import json
 import os
+import tempfile
 import uuid
 from typing import Generator, Optional
 
@@ -10,6 +11,15 @@ import streamlit as st
 
 
 def _get_access_token() -> str:
+    # Try to get credentials from Streamlit secrets (for Streamlit Cloud)
+    if "GOOGLE_APPLICATION_CREDENTIALS_JSON" in st.secrets:
+        creds_dict = st.secrets["GOOGLE_APPLICATION_CREDENTIALS_JSON"]
+        # Write to a temporary file
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+            json.dump(creds_dict, f)
+            creds_path = f.name
+        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = creds_path
+    
     creds, _ = google.auth.default(
         scopes=["https://www.googleapis.com/auth/cloud-platform"]
     )
@@ -95,7 +105,16 @@ if "user_id" not in st.session_state:
 
 with st.sidebar:
     st.header("Configuration")
-    default_engine = os.getenv("REASONING_ENGINE", "")
+    
+    # Check if credentials are available
+    has_credentials = (
+        "GOOGLE_APPLICATION_CREDENTIALS_JSON" in st.secrets or 
+        os.getenv("GOOGLE_APPLICATION_CREDENTIALS") is not None
+    )
+    if not has_credentials:
+        st.warning("⚠️ Google Cloud credentials not found. Please add them via Streamlit secrets.")
+    
+    default_engine = os.getenv("REASONING_ENGINE", st.secrets.get("REASONING_ENGINE", ""))
     engine = st.text_input(
         "Reasoning Engine resource name",
         value=default_engine,
@@ -114,6 +133,11 @@ prompt = st.chat_input("Ask a question")
 if prompt:
     if not engine.strip():
         st.error("Please enter the Reasoning Engine resource name.")
+    elif not (
+        "GOOGLE_APPLICATION_CREDENTIALS_JSON" in st.secrets or 
+        os.getenv("GOOGLE_APPLICATION_CREDENTIALS") is not None
+    ):
+        st.error("❌ Google Cloud credentials not configured. Please add GOOGLE_APPLICATION_CREDENTIALS_JSON to Streamlit secrets.")
     else:
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
