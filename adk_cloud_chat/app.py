@@ -1,5 +1,6 @@
 import json
 import os
+import uuid
 from typing import Generator, Optional
 
 import google.auth
@@ -89,6 +90,9 @@ st.caption("Chat with a deployed Vertex AI Reasoning Engine.")
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
+if "user_id" not in st.session_state:
+    st.session_state.user_id = str(uuid.uuid4())[:8]
+
 with st.sidebar:
     st.header("Configuration")
     default_engine = os.getenv("REASONING_ENGINE", "")
@@ -97,7 +101,7 @@ with st.sidebar:
         value=default_engine,
         placeholder="projects/PROJECT/locations/REGION/reasoningEngines/ENGINE_ID",
     )
-    user_id = st.text_input("User ID", value="local-user")
+    user_id = st.text_input("User ID", value=st.session_state.user_id)
     if st.button("Clear chat"):
         st.session_state.messages = []
         st.rerun()
