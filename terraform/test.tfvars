@@ -1,0 +1,5 @@
+project           = "wranglr-test"
+region            = "australia-southeast1"
+env               = "test"
+app_name          = "ai-invoice-extractor-2"
+docker_image_name = "australia-southeast1-docker.pkg.dev/wranglr-test/test-ai-invoice-extractor-2/ai-invoice-extractor-2"

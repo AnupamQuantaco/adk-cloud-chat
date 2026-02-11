@@ -1,0 +1,52 @@
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - '-c'
+      - |
+        set -x -e
+        declare -A project=( ["wranglr-development"]="dev"  ["wranglr-test"]="test" ["wranglr"]="prod")
+        export env=${project["$PROJECT_ID"]}
+        echo "env=$env" > /workspace/build_vars
+        TAG=${COMMIT_SHA:-$BUILD_ID}
+        echo "TAG=$$TAG" >> /workspace/build_vars
+    id: Environment
+    waitFor:
+      - '-'
+    entrypoint: bash
+    allowFailure: true
+
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - '-c'
+      - |
+        set -x -e
+        source /workspace/build_vars
+        echo $env
+        image_name=${_ARTIFACT_REGISTRY_PREFIX}/$PROJECT_ID/${env}-${_IMG_PREFIX}/adk-cloud-chat
+        docker build -t ${image_name}:$$TAG -t ${image_name}:latest .
+        docker push ${image_name} --all-tags
+    id: Build docker image
+    waitFor:
+      - Environment
+    entrypoint: bash
+    allowFailure: true
+
+  - name: 'hashicorp/terraform:1.4'
+    args:
+      - '-c'
+      - |
+        set -x -e
+        cd terraform
+        chmod +x ./run_terraform.sh
+        source /workspace/build_vars
+        ./run_terraform.sh $env Y
+    id: TF ADK Cloud Chat
+    waitFor:
+      - Build docker image
+    entrypoint: sh
+    allowFailure: true
+
+
+substitutions:
+  _ARTIFACT_REGISTRY_PREFIX: australia-southeast1-docker.pkg.dev
+  _IMG_PREFIX: adk-cloud-chat

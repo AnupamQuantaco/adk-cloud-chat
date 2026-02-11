@@ -1,0 +1,5 @@
+project           = "wranglr-development"
+region            = "australia-southeast1"
+env               = "dev"
+app_name          = "adk-cloud-chat"
+docker_image_name = "australia-southeast1-docker.pkg.dev/wranglr-development/dev-adk-cloud-chat/adk-cloud-chat"
