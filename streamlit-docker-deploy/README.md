@@ -19,3 +19,13 @@ Then open `http://localhost:8501`.
 
 ## Use your app
 Replace `streamlit-docker-deploy/streamlit_app.py` with your Streamlit app.
+
+## Deploy To Cloud Run
+This folder has its own Cloud Build config for the live Streamlit service:
+
+```bash
+gcloud builds submit --config=streamlit-docker-deploy/cloudbuild.yaml .
+```
+
+That config deploys to the Cloud Run service `cloud-chat-ui-quantaco` in
+`australia-southeast1`.

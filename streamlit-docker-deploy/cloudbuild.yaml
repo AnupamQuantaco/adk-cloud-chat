@@ -1,0 +1,32 @@
+steps:
+  - name: gcr.io/cloud-builders/docker
+    id: Build
+    args:
+      - build
+      - -f
+      - streamlit-docker-deploy/Dockerfile
+      - -t
+      - australia-southeast1-docker.pkg.dev/wranglr-development/cloud-run-source-deploy/cloud-chat-ui-quantaco:latest
+      - .
+
+  - name: gcr.io/cloud-builders/docker
+    id: Push
+    args:
+      - push
+      - australia-southeast1-docker.pkg.dev/wranglr-development/cloud-run-source-deploy/cloud-chat-ui-quantaco:latest
+
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    id: Deploy
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - cloud-chat-ui-quantaco
+      - --image=australia-southeast1-docker.pkg.dev/wranglr-development/cloud-run-source-deploy/cloud-chat-ui-quantaco:latest
+      - --region=australia-southeast1
+      - --platform=managed
+      - --allow-unauthenticated
+      - --port=8080
+
+options:
+  logging: CLOUD_LOGGING_ONLY
