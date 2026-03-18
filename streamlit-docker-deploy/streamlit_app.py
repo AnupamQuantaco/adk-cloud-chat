@@ -78,10 +78,6 @@ def _parse_stream_event_line(line: str) -> Optional[dict]:
         return None
 
 
-def _parse_json_response(text: str) -> dict:
-    return json.loads(_strip_code_fences(text))
-
-
 def _strip_code_fences(text: str) -> str:
     cleaned = text.strip()
     if cleaned.startswith("```json"):
@@ -93,9 +89,79 @@ def _strip_code_fences(text: str) -> str:
     return cleaned
 
 
+def _extract_first_json_object(text: str) -> str:
+    start = None
+    in_string = False
+    escape = False
+    depth = 0
+    for idx, ch in enumerate(text):
+        if start is None:
+            if ch == "{":
+                start = idx
+                depth = 1
+            continue
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : idx + 1]
+    if start is not None:
+        return text[start:]
+    return text
+
+
+def _escape_invalid_json_backslashes(text: str) -> str:
+    result = []
+    in_string = False
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if ch == '"':
+            backslash_count = 0
+            j = i - 1
+            while j >= 0 and text[j] == "\\":
+                backslash_count += 1
+                j -= 1
+            if backslash_count % 2 == 0:
+                in_string = not in_string
+            result.append(ch)
+            i += 1
+            continue
+        if in_string and ch == "\\":
+            next_char = text[i + 1] if i + 1 < len(text) else ""
+            if next_char not in {'"', "\\", "/", "b", "f", "n", "r", "t", "u"}:
+                result.append("\\\\")
+                i += 1
+                continue
+        result.append(ch)
+        i += 1
+    return "".join(result)
+
+
+def _parse_json_response(text: str) -> dict:
+    cleaned = _strip_code_fences(text)
+    candidate = _extract_first_json_object(cleaned)
+    try:
+        return json.loads(candidate)
+    except json.JSONDecodeError:
+        repaired = _escape_invalid_json_backslashes(candidate)
+        return json.loads(repaired)
+
+
 def _try_parse_json_response(text: str) -> Optional[dict]:
     try:
-        return json.loads(_strip_code_fences(text))
+        return _parse_json_response(text)
     except json.JSONDecodeError:
         return None
 
@@ -372,7 +438,12 @@ def _summarize_batch_results(batch_report: dict) -> str:
         lines.append("")
         lines.append("Failures:")
         for failure in failures:
-            lines.append(f"- {failure}")
+            if isinstance(failure, dict):
+                lines.append(
+                    f"- {failure.get('filename', 'unknown')}: {failure.get('error', '')}"
+                )
+            else:
+                lines.append(f"- {failure}")
 
     return "\n".join(lines)
 
@@ -407,13 +478,20 @@ def _run_batch_comparison(
         filename = os.path.basename(gs_uri)
         placeholder.markdown(f"Processing {index}/{total}: `{filename}`")
         prompt = _build_single_file_prompt(gs_uri, filename, url_1, url_2)
+        final_text = ""
         try:
             final_text = _query_text(engine, prompt, user_id)
             report = _parse_json_response(final_text)
             reports[filename] = report
             file_summaries[filename] = _build_file_summary(filename, report)
         except Exception as exc:
-            failures.append(f"{filename}: {exc}")
+            failures.append(
+                {
+                    "filename": filename,
+                    "error": str(exc),
+                    "raw_response": final_text,
+                }
+            )
     major_mismatch_file_count = sum(
         1
         for summary in file_summaries.values()
