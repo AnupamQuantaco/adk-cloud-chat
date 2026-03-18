@@ -166,6 +166,30 @@ def _try_parse_json_response(text: str) -> Optional[dict]:
         return None
 
 
+def _normalize_invoice_report(payload: dict) -> dict:
+    if not isinstance(payload, dict):
+        return payload
+
+    if "comparison_results" in payload:
+        return payload
+
+    wrapped = payload.get("compare_invoices_gcs_response")
+    if isinstance(wrapped, dict):
+        inner = wrapped.get("result")
+        if isinstance(inner, dict):
+            return _normalize_invoice_report(inner)
+        if isinstance(inner, str):
+            return _normalize_invoice_report(_parse_json_response(inner))
+
+    inner = payload.get("result")
+    if isinstance(inner, dict):
+        return _normalize_invoice_report(inner)
+    if isinstance(inner, str):
+        return _normalize_invoice_report(_parse_json_response(inner))
+
+    return payload
+
+
 def _infer_region(engine: str) -> str:
     marker = "/locations/"
     if marker in engine:
@@ -481,17 +505,20 @@ def _run_batch_comparison(
         final_text = ""
         try:
             final_text = _query_text(engine, prompt, user_id)
-            report = _parse_json_response(final_text)
-            reports[filename] = report
-            file_summaries[filename] = _build_file_summary(filename, report)
+            parsed = _parse_json_response(final_text)
+            normalized = _normalize_invoice_report(parsed)
+            reports[filename] = normalized
+            file_summaries[filename] = _build_file_summary(filename, normalized)
         except Exception as exc:
-            failures.append(
-                {
-                    "filename": filename,
-                    "error": str(exc),
-                    "raw_response": final_text,
-                }
-            )
+            failure = {
+                "filename": filename,
+                "error": str(exc),
+                "raw_response": final_text,
+            }
+            parsed_outer = _try_parse_json_response(final_text) if final_text else None
+            if isinstance(parsed_outer, dict):
+                failure["parsed_outer_payload"] = parsed_outer
+            failures.append(failure)
     major_mismatch_file_count = sum(
         1
         for summary in file_summaries.values()
