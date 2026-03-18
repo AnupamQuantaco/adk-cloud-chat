@@ -4,6 +4,7 @@ import random
 import time
 import uuid
 from collections import Counter
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Generator, Optional
 
@@ -177,32 +178,18 @@ def _list_pdf_gcs_uris(gs_prefix: str) -> list[str]:
 
 
 def _build_single_file_prompt(gs_uri: str, filename: str, url_1: str, url_2: str) -> str:
-    return (
-        "Use compare_invoices_gcs for exactly one invoice file.\n"
-        "Do not compare a folder or multiple files.\n"
-        "Call compare_invoices_gcs with:\n"
-        f"gs_uri: {gs_uri}\n"
-        f"filename: {filename}\n"
-        f"url_1: {url_1}\n"
-        f"url_2: {url_2}\n\n"
-        "Return only the JSON report for that single file."
-    )
-
-
-def _build_folder_batch_prompt(
-    gs_prefix: str, batch_count: int, random_sample: bool, url_1: str, url_2: str
-) -> str:
-    random_value = "true" if random_sample else "false"
-    return (
-        "Use compare_invoices_gcs_folder for a folder batch comparison.\n"
-        "Call compare_invoices_gcs_folder with:\n"
-        f"gcs_prefix: {gs_prefix}\n"
-        f"batch_file_count: {batch_count}\n"
-        f"random_sample: {random_value}\n"
-        f"url_1: {url_1}\n"
-        f"url_2: {url_2}\n\n"
-        "Return only the batch summary JSON."
-    )
+    lines = [
+        "Use compare_invoices_gcs with:",
+        f"gs_uri: {gs_uri}",
+        f"filename: {filename}",
+    ]
+    if url_1:
+        lines.append(f"url_1: {url_1}")
+    if url_2:
+        lines.append(f"url_2: {url_2}")
+    lines.append("")
+    lines.append("Return only the JSON report.")
+    return "\n".join(lines)
 
 
 def _build_report_analysis_prompt(
@@ -250,34 +237,59 @@ def _extract_selected_files(payload: dict) -> list[str]:
     return selected_files
 
 
-def _summarize_batch_json(payload: dict) -> str:
-    selected_files = _extract_selected_files(payload)
-    processed = payload.get("processed_file_count")
-    if processed is None:
-        processed = payload.get("processed_files")
-    matched = payload.get("matched_file_count")
-    mismatched = payload.get("mismatched_file_count")
-    failures = payload.get("failure_count")
-    report_gcs_uri = _extract_report_gcs_uri(payload)
+def _extract_potential_mismatch_keys(report: dict) -> list[str]:
+    mismatch_keys = []
+    for item in report.get("comparison_results", []):
+        if not isinstance(item, dict):
+            continue
+        status = str(item.get("status", "")).strip().lower()
+        if "mismatch" not in status:
+            continue
+        key = item.get("key") or item.get("field") or "unknown_field"
+        mismatch_keys.append(str(key))
+    return mismatch_keys
 
-    lines = ["### Batch Comparison Summary"]
-    if processed is not None:
-        lines.append(f"Processed file count: {processed}")
-    if matched is not None:
-        lines.append(f"Matched files: {matched}")
-    if mismatched is not None:
-        lines.append(f"Mismatched files: {mismatched}")
-    if failures is not None:
-        lines.append(f"Failures: {failures}")
-    if selected_files:
-        lines.append("")
-        lines.append("Selected files:")
-        for filename in selected_files:
-            lines.append(f"- {filename}")
-    if report_gcs_uri:
-        lines.append("")
-        lines.append(f"Saved report: `{report_gcs_uri}`")
-    return "\n".join(lines)
+
+def _extract_real_concerns(report: dict) -> list[str]:
+    real_concerns = []
+    for item in report.get("comparison_results", []):
+        if not isinstance(item, dict):
+            continue
+        status = str(item.get("status", "")).strip().lower()
+        if "real concern" not in status and "major mismatch" not in status:
+            continue
+        key = item.get("key") or item.get("field") or "unknown_field"
+        real_concerns.append(str(key))
+    return real_concerns
+
+
+def _build_file_summary(filename: str, report: dict) -> dict:
+    potential_mismatch_keys = _extract_potential_mismatch_keys(report)
+    real_concerns = _extract_real_concerns(report)
+    extraction_failures = report.get("extraction_failures", [])
+    if not isinstance(extraction_failures, list):
+        extraction_failures = [str(extraction_failures)]
+
+    return {
+        "overall_mismatch_found": bool(potential_mismatch_keys),
+        "extraction_failures": extraction_failures,
+        "major_mismatch_count": len(real_concerns),
+        "mismatched_files": [filename] if potential_mismatch_keys else [],
+        "real_concerns": real_concerns,
+        "potential_mismatch_keys": potential_mismatch_keys,
+    }
+
+
+def _write_json_to_gcs(payload: dict, bucket_name: str, prefix: str) -> str:
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    object_name = (
+        f"{prefix.rstrip('/')}/"
+        f"invoice-comparison-ui-batch-report-{timestamp}-{uuid.uuid4().hex}.json"
+    )
+    client = storage.Client()
+    blob = client.bucket(bucket_name).blob(object_name)
+    blob.upload_from_string(json.dumps(payload, indent=2), content_type="application/json")
+    return f"gs://{bucket_name}/{object_name}"
 
 
 def _store_batch_report(
@@ -296,7 +308,9 @@ def _store_batch_report(
     st.session_state.last_batch_report_gcs_uri = report_gcs_uri
     st.session_state.last_batch_result_json = payload
     st.session_state.last_batch_selected_files = selected_files
-    st.session_state.last_batch_summary_text = summary_text or _summarize_batch_json(payload)
+    st.session_state.last_batch_summary_text = summary_text or _summarize_batch_results(
+        payload
+    )
     return True
 
 
@@ -309,51 +323,50 @@ def _try_store_batch_report_from_text(
     return _store_batch_report(payload, selected_files_hint=selected_files_hint)
 
 
-def _summarize_batch_results(results: dict, failures: list[str]) -> str:
-    matched_files = []
-    mismatched_files = []
+def _summarize_batch_results(batch_report: dict) -> str:
+    selected_files = batch_report.get("selected_files", [])
+    file_summaries = batch_report.get("file_summaries", {})
+    failures = batch_report.get("failures", [])
+    report_gcs_uri = batch_report.get("report_gcs_uri", "")
     field_counts: Counter[str] = Counter()
+    matched_count = 0
+    mismatched_count = 0
 
-    for filename, report in results.items():
-        comparison_results = report.get("comparison_results", [])
-        mismatches = []
-        for item in comparison_results:
-            if not isinstance(item, dict):
-                continue
-            status = str(item.get("status", "")).strip().lower()
-            if "mismatch" not in status:
-                continue
-            key = item.get("key") or item.get("field") or "unknown_field"
-            mismatches.append(str(key))
-        if mismatches:
-            mismatched_files.append((filename, mismatches))
-            field_counts.update(mismatches)
+    for filename in selected_files:
+        summary = file_summaries.get(filename, {})
+        mismatch_keys = summary.get("potential_mismatch_keys", [])
+        if mismatch_keys:
+            mismatched_count += 1
+            field_counts.update(mismatch_keys)
         else:
-            matched_files.append(filename)
+            matched_count += 1
 
-    processed_count = len(results) + len(failures)
     lines = [
         "### Batch Comparison Summary",
-        f"Processed file count: {processed_count}",
-        f"Matched files: {len(matched_files)}",
-        f"Mismatched files: {len(mismatched_files)}",
+        f"Requested file count: {batch_report.get('requested_count', 0)}",
+        f"Matched files: {matched_count}",
+        f"Mismatched files: {mismatched_count}",
         f"Failures: {len(failures)}",
     ]
 
-    if mismatched_files:
+    if selected_files:
         lines.append("")
-        lines.append("Mismatched files by field:")
-        for filename, mismatches in mismatched_files:
-            lines.append(f"- {filename}: {', '.join(mismatches)}")
+        lines.append("Selected files:")
+        for filename in selected_files:
+            lines.append(f"- {filename}")
 
     if field_counts:
         lines.append("")
         lines.append("Most common mismatched fields overall:")
         for field, count in field_counts.most_common():
             lines.append(f"- {field}: {count}")
-    elif results:
+    elif file_summaries:
         lines.append("")
         lines.append("No mismatches found in this batch.")
+
+    if report_gcs_uri:
+        lines.append("")
+        lines.append(f"Saved report: `{report_gcs_uri}`")
 
     if failures:
         lines.append("")
@@ -365,10 +378,11 @@ def _summarize_batch_results(results: dict, failures: list[str]) -> str:
 
 
 def _select_batch_files(
-    pdf_uris: list[str], batch_count: int, random_sample: bool
+    pdf_uris: list[str], batch_count: int, random_sample: bool, seed: str
 ) -> list[str]:
     if random_sample:
-        return random.sample(pdf_uris, min(batch_count, len(pdf_uris)))
+        rng = random.Random(seed or None)
+        return rng.sample(pdf_uris, min(batch_count, len(pdf_uris)))
     return pdf_uris[:batch_count]
 
 
@@ -379,9 +393,14 @@ def _run_batch_comparison(
     url_1: str,
     url_2: str,
     placeholder,
-) -> str:
+    gs_prefix: str,
+    requested_count: int,
+    random_sample: bool,
+    seed: str,
+) -> dict:
     reports = {}
     failures = []
+    file_summaries = {}
     total = len(selected_uris)
 
     for index, gs_uri in enumerate(selected_uris, start=1):
@@ -390,11 +409,31 @@ def _run_batch_comparison(
         prompt = _build_single_file_prompt(gs_uri, filename, url_1, url_2)
         try:
             final_text = _query_text(engine, prompt, user_id)
-            reports[filename] = _parse_json_response(final_text)
+            report = _parse_json_response(final_text)
+            reports[filename] = report
+            file_summaries[filename] = _build_file_summary(filename, report)
         except Exception as exc:
             failures.append(f"{filename}: {exc}")
-
-    return _summarize_batch_results(reports, failures)
+    major_mismatch_file_count = sum(
+        1
+        for summary in file_summaries.values()
+        if summary.get("major_mismatch_count", 0) > 0
+    )
+    batch_report = {
+        "gs_prefix": gs_prefix,
+        "requested_count": requested_count,
+        "random_sample": random_sample,
+        "seed": seed,
+        "selected_files": [os.path.basename(gs_uri) for gs_uri in selected_uris],
+        "reports": reports,
+        "failures": failures,
+        "file_summaries": file_summaries,
+        "major_mismatch_file_count": major_mismatch_file_count,
+    }
+    batch_report["report_gcs_uri"] = _write_json_to_gcs(
+        batch_report, bucket_name="invoice-comparison", prefix="reports"
+    )
+    return batch_report
 
 
 st.set_page_config(page_title="ADK Cloud Chat", page_icon=LOGO_PATH)
@@ -434,6 +473,7 @@ with st.sidebar:
     )
     batch_count = st.number_input("Batch file count", min_value=1, max_value=50, value=5)
     batch_random = st.checkbox("Random sample", value=True)
+    batch_seed = st.text_input("Random seed (optional)", value="")
     url_1 = st.text_input(
         "Extractor URL 1",
         value=os.getenv(
@@ -511,28 +551,22 @@ if run_batch:
                     placeholder.markdown(summary)
                 else:
                     selected_uris = _select_batch_files(
-                        pdf_uris, int(batch_count), batch_random
+                        pdf_uris, int(batch_count), batch_random, batch_seed.strip()
                     )
-                    selected_files = [os.path.basename(gs_uri) for gs_uri in selected_uris]
-                    batch_prompt = _build_folder_batch_prompt(
+                    batch_report = _run_batch_comparison(
+                        engine.strip(),
+                        user_id.strip(),
+                        selected_uris,
+                        url_1.strip(),
+                        url_2.strip(),
+                        placeholder,
                         gcs_prefix.strip(),
                         int(batch_count),
                         batch_random,
-                        url_1.strip(),
-                        url_2.strip(),
+                        batch_seed.strip(),
                     )
-                    placeholder.markdown("Running folder batch comparison...")
-                    response_text = _query_text(engine.strip(), batch_prompt, user_id.strip())
-                    payload = _try_parse_json_response(response_text)
-                    if isinstance(payload, dict):
-                        summary = _summarize_batch_json(payload)
-                        _store_batch_report(
-                            payload,
-                            selected_files_hint=selected_files,
-                            summary_text=summary,
-                        )
-                    else:
-                        summary = response_text
+                    summary = _summarize_batch_results(batch_report)
+                    _store_batch_report(batch_report, summary_text=summary)
                     placeholder.markdown(summary)
             except requests.HTTPError as exc:
                 summary = f"HTTP error: {exc}"
