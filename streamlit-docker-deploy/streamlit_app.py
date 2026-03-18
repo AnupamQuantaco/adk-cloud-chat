@@ -149,6 +149,16 @@ def _escape_invalid_json_backslashes(text: str) -> str:
     return "".join(result)
 
 
+def _repair_nested_json_string(text: str) -> str:
+    repaired = text.strip()
+    if repaired.startswith('"') and repaired.endswith('"'):
+        repaired = repaired[1:-1]
+    repaired = repaired.replace('\\"', '"')
+    repaired = repaired.replace("\\n", "\n")
+    repaired = repaired.replace("\\t", "\t")
+    return repaired
+
+
 def _parse_json_response(text: str) -> dict:
     cleaned = _strip_code_fences(text)
     candidate = _extract_first_json_object(cleaned)
@@ -177,15 +187,23 @@ def _normalize_invoice_report(payload: dict) -> dict:
     if isinstance(wrapped, dict):
         inner = wrapped.get("result")
         if isinstance(inner, dict):
-            return _normalize_invoice_report(inner)
+            return inner
         if isinstance(inner, str):
-            return _normalize_invoice_report(_parse_json_response(inner))
+            try:
+                return _parse_json_response(inner)
+            except Exception:
+                repaired = _repair_nested_json_string(inner)
+                return _parse_json_response(repaired)
 
     inner = payload.get("result")
     if isinstance(inner, dict):
-        return _normalize_invoice_report(inner)
+        return inner
     if isinstance(inner, str):
-        return _normalize_invoice_report(_parse_json_response(inner))
+        try:
+            return _parse_json_response(inner)
+        except Exception:
+            repaired = _repair_nested_json_string(inner)
+            return _parse_json_response(repaired)
 
     return payload
 
@@ -327,46 +345,24 @@ def _extract_selected_files(payload: dict) -> list[str]:
     return selected_files
 
 
-def _extract_potential_mismatch_keys(report: dict) -> list[str]:
-    mismatch_keys = []
-    for item in report.get("comparison_results", []):
-        if not isinstance(item, dict):
-            continue
-        status = str(item.get("status", "")).strip().lower()
-        if "mismatch" not in status:
-            continue
-        key = item.get("key") or item.get("field") or "unknown_field"
-        mismatch_keys.append(str(key))
-    return mismatch_keys
-
-
-def _extract_real_concerns(report: dict) -> list[str]:
-    real_concerns = []
-    for item in report.get("comparison_results", []):
-        if not isinstance(item, dict):
-            continue
-        status = str(item.get("status", "")).strip().lower()
-        if "real concern" not in status and "major mismatch" not in status:
-            continue
-        key = item.get("key") or item.get("field") or "unknown_field"
-        real_concerns.append(str(key))
-    return real_concerns
-
-
-def _build_file_summary(filename: str, report: dict) -> dict:
-    potential_mismatch_keys = _extract_potential_mismatch_keys(report)
-    real_concerns = _extract_real_concerns(report)
+def _build_file_summary(report: dict) -> dict:
+    comparison_results = report.get("comparison_results", []) or []
+    llm_report = report.get("llm_report", {}) or {}
     extraction_failures = report.get("extraction_failures", [])
     if not isinstance(extraction_failures, list):
         extraction_failures = [str(extraction_failures)]
 
     return {
-        "overall_mismatch_found": bool(potential_mismatch_keys),
+        "overall_mismatch_found": report.get("overall_mismatch_found", False),
         "extraction_failures": extraction_failures,
-        "major_mismatch_count": len(real_concerns),
-        "mismatched_files": [filename] if potential_mismatch_keys else [],
-        "real_concerns": real_concerns,
-        "potential_mismatch_keys": potential_mismatch_keys,
+        "major_mismatch_count": report.get("major_mismatch_count", 0),
+        "mismatched_files": report.get("mismatched_files", []),
+        "real_concerns": llm_report.get("real_concerns", []),
+        "potential_mismatch_keys": [
+            item.get("key")
+            for item in comparison_results
+            if isinstance(item, dict) and item.get("status") == "Potential Mismatch"
+        ],
     }
 
 
@@ -508,11 +504,14 @@ def _run_batch_comparison(
             parsed = _parse_json_response(final_text)
             normalized = _normalize_invoice_report(parsed)
             reports[filename] = normalized
-            file_summaries[filename] = _build_file_summary(filename, normalized)
+            file_summaries[filename] = _build_file_summary(normalized)
         except Exception as exc:
+            error_text = str(exc)
+            if "compare_invoices_gcs" in final_text and "unavailable" in final_text.lower():
+                error_text = f"wrong-engine usage: {error_text}"
             failure = {
                 "filename": filename,
-                "error": str(exc),
+                "error": error_text,
                 "raw_response": final_text,
             }
             parsed_outer = _try_parse_json_response(final_text) if final_text else None
