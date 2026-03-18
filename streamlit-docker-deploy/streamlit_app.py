@@ -78,6 +78,10 @@ def _parse_stream_event_line(line: str) -> Optional[dict]:
 
 
 def _parse_json_response(text: str) -> dict:
+    return json.loads(_strip_code_fences(text))
+
+
+def _strip_code_fences(text: str) -> str:
     cleaned = text.strip()
     if cleaned.startswith("```json"):
         cleaned = cleaned[len("```json"):].strip()
@@ -85,7 +89,14 @@ def _parse_json_response(text: str) -> dict:
         cleaned = cleaned[len("```"):].strip()
     if cleaned.endswith("```"):
         cleaned = cleaned[:-3].strip()
-    return json.loads(cleaned)
+    return cleaned
+
+
+def _try_parse_json_response(text: str) -> Optional[dict]:
+    try:
+        return json.loads(_strip_code_fences(text))
+    except json.JSONDecodeError:
+        return None
 
 
 def _infer_region(engine: str) -> str:
@@ -176,6 +187,126 @@ def _build_single_file_prompt(gs_uri: str, filename: str, url_1: str, url_2: str
         f"url_2: {url_2}\n\n"
         "Return only the JSON report for that single file."
     )
+
+
+def _build_folder_batch_prompt(
+    gs_prefix: str, batch_count: int, random_sample: bool, url_1: str, url_2: str
+) -> str:
+    random_value = "true" if random_sample else "false"
+    return (
+        "Use compare_invoices_gcs_folder for a folder batch comparison.\n"
+        "Call compare_invoices_gcs_folder with:\n"
+        f"gcs_prefix: {gs_prefix}\n"
+        f"batch_file_count: {batch_count}\n"
+        f"random_sample: {random_value}\n"
+        f"url_1: {url_1}\n"
+        f"url_2: {url_2}\n\n"
+        "Return only the batch summary JSON."
+    )
+
+
+def _build_report_analysis_prompt(
+    report_gcs_uri: str, question: str, filename: Optional[str] = None
+) -> str:
+    lines = [
+        "Use analyze_invoice_comparison_report with:",
+        f"report_gcs_uri: {report_gcs_uri}",
+    ]
+    if filename:
+        lines.append(f"filename: {filename}")
+    lines.append(f"question: {question}")
+    lines.append("")
+    lines.append("Return a human-readable answer.")
+    return "\n".join(lines)
+
+
+def _extract_report_gcs_uri(payload: dict) -> Optional[str]:
+    for key in ("report_gcs_uri", "reportUri", "report_uri"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _extract_selected_files(payload: dict) -> list[str]:
+    candidates = []
+    for key in ("selected_files", "selected_filenames", "files", "filenames"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            candidates = value
+            break
+
+    selected_files = []
+    for item in candidates:
+        if isinstance(item, str) and item.strip():
+            selected_files.append(item.strip())
+            continue
+        if isinstance(item, dict):
+            for key in ("filename", "name", "gs_uri", "uri"):
+                value = item.get(key)
+                if isinstance(value, str) and value.strip():
+                    selected_files.append(os.path.basename(value.strip()))
+                    break
+    return selected_files
+
+
+def _summarize_batch_json(payload: dict) -> str:
+    selected_files = _extract_selected_files(payload)
+    processed = payload.get("processed_file_count")
+    if processed is None:
+        processed = payload.get("processed_files")
+    matched = payload.get("matched_file_count")
+    mismatched = payload.get("mismatched_file_count")
+    failures = payload.get("failure_count")
+    report_gcs_uri = _extract_report_gcs_uri(payload)
+
+    lines = ["### Batch Comparison Summary"]
+    if processed is not None:
+        lines.append(f"Processed file count: {processed}")
+    if matched is not None:
+        lines.append(f"Matched files: {matched}")
+    if mismatched is not None:
+        lines.append(f"Mismatched files: {mismatched}")
+    if failures is not None:
+        lines.append(f"Failures: {failures}")
+    if selected_files:
+        lines.append("")
+        lines.append("Selected files:")
+        for filename in selected_files:
+            lines.append(f"- {filename}")
+    if report_gcs_uri:
+        lines.append("")
+        lines.append(f"Saved report: `{report_gcs_uri}`")
+    return "\n".join(lines)
+
+
+def _store_batch_report(
+    payload: dict,
+    selected_files_hint: Optional[list[str]] = None,
+    summary_text: Optional[str] = None,
+) -> bool:
+    report_gcs_uri = _extract_report_gcs_uri(payload)
+    if not report_gcs_uri:
+        return False
+
+    selected_files = _extract_selected_files(payload)
+    if not selected_files and selected_files_hint:
+        selected_files = list(selected_files_hint)
+
+    st.session_state.last_batch_report_gcs_uri = report_gcs_uri
+    st.session_state.last_batch_result_json = payload
+    st.session_state.last_batch_selected_files = selected_files
+    st.session_state.last_batch_summary_text = summary_text or _summarize_batch_json(payload)
+    return True
+
+
+def _try_store_batch_report_from_text(
+    text: str, selected_files_hint: Optional[list[str]] = None
+) -> bool:
+    payload = _try_parse_json_response(text)
+    if not isinstance(payload, dict):
+        return False
+    return _store_batch_report(payload, selected_files_hint=selected_files_hint)
 
 
 def _summarize_batch_results(results: dict, failures: list[str]) -> str:
@@ -275,9 +406,17 @@ if "messages" not in st.session_state:
     st.session_state.messages = []
 if "user_id" not in st.session_state:
     st.session_state.user_id = f"anon-{uuid.uuid4()}"
+if "last_batch_report_gcs_uri" not in st.session_state:
+    st.session_state.last_batch_report_gcs_uri = ""
+if "last_batch_result_json" not in st.session_state:
+    st.session_state.last_batch_result_json = {}
+if "last_batch_selected_files" not in st.session_state:
+    st.session_state.last_batch_selected_files = []
+if "last_batch_summary_text" not in st.session_state:
+    st.session_state.last_batch_summary_text = ""
 
 with st.sidebar:
-    st.image(LABEL_PATH, use_container_width=True)
+    st.image(LABEL_PATH, width="stretch")
     st.header("Configuration")
     default_engine = os.getenv("REASONING_ENGINE", "")
     engine = st.text_input(
@@ -310,8 +449,38 @@ with st.sidebar:
         ),
     )
     run_batch = st.button("Run folder batch")
+    st.subheader("Batch Report")
+    has_saved_report = bool(st.session_state.last_batch_report_gcs_uri)
+    st.write(f"Available: {'Yes' if has_saved_report else 'No'}")
+    if has_saved_report:
+        st.code(st.session_state.last_batch_report_gcs_uri)
+        if st.session_state.last_batch_selected_files:
+            st.caption("Selected files")
+            for filename in st.session_state.last_batch_selected_files:
+                st.write(f"- {filename}")
+    else:
+        st.caption("No saved batch report yet.")
+
+    report_file_options = ["All files"] + st.session_state.last_batch_selected_files
+    report_followup_file = st.selectbox(
+        "Report file filter",
+        options=report_file_options,
+        disabled=not has_saved_report,
+    )
+    report_followup_question = st.text_input(
+        "Ask about last batch report",
+        placeholder="Summarize the mismatches",
+        disabled=not has_saved_report,
+    )
+    run_report_analysis = st.button(
+        "Analyze last batch report", disabled=not has_saved_report
+    )
     if st.button("Clear chat"):
         st.session_state.messages = []
+        st.session_state.last_batch_report_gcs_uri = ""
+        st.session_state.last_batch_result_json = {}
+        st.session_state.last_batch_selected_files = []
+        st.session_state.last_batch_summary_text = ""
         st.rerun()
 
 for message in st.session_state.messages:
@@ -344,14 +513,26 @@ if run_batch:
                     selected_uris = _select_batch_files(
                         pdf_uris, int(batch_count), batch_random
                     )
-                    summary = _run_batch_comparison(
-                        engine.strip(),
-                        user_id.strip(),
-                        selected_uris,
+                    selected_files = [os.path.basename(gs_uri) for gs_uri in selected_uris]
+                    batch_prompt = _build_folder_batch_prompt(
+                        gcs_prefix.strip(),
+                        int(batch_count),
+                        batch_random,
                         url_1.strip(),
                         url_2.strip(),
-                        placeholder,
                     )
+                    placeholder.markdown("Running folder batch comparison...")
+                    response_text = _query_text(engine.strip(), batch_prompt, user_id.strip())
+                    payload = _try_parse_json_response(response_text)
+                    if isinstance(payload, dict):
+                        summary = _summarize_batch_json(payload)
+                        _store_batch_report(
+                            payload,
+                            selected_files_hint=selected_files,
+                            summary_text=summary,
+                        )
+                    else:
+                        summary = response_text
                     placeholder.markdown(summary)
             except requests.HTTPError as exc:
                 summary = f"HTTP error: {exc}"
@@ -360,6 +541,41 @@ if run_batch:
                 summary = f"Error: {exc}"
                 placeholder.markdown(summary)
         st.session_state.messages.append({"role": "assistant", "content": summary})
+
+if run_report_analysis:
+    if not engine.strip():
+        st.error("Please enter the Reasoning Engine resource name.")
+    elif not report_followup_question.strip():
+        st.error("Please enter a question for the saved batch report.")
+    elif not st.session_state.last_batch_report_gcs_uri:
+        st.error("No saved batch report is available.")
+    else:
+        selected_filename = None
+        if report_followup_file != "All files":
+            selected_filename = report_followup_file
+        prompt_text = _build_report_analysis_prompt(
+            st.session_state.last_batch_report_gcs_uri,
+            report_followup_question.strip(),
+            filename=selected_filename,
+        )
+        visible_question = report_followup_question.strip()
+        if selected_filename:
+            visible_question = f"{visible_question} (file: {selected_filename})"
+        st.session_state.messages.append({"role": "user", "content": visible_question})
+        with st.chat_message("user"):
+            st.markdown(visible_question)
+        with st.chat_message("assistant", avatar=LOGO_PATH):
+            placeholder = st.empty()
+            try:
+                response_text = _query_text(engine.strip(), prompt_text, user_id.strip())
+                placeholder.markdown(response_text)
+            except requests.HTTPError as exc:
+                response_text = f"HTTP error: {exc}"
+                placeholder.markdown(response_text)
+            except Exception as exc:
+                response_text = f"Error: {exc}"
+                placeholder.markdown(response_text)
+        st.session_state.messages.append({"role": "assistant", "content": response_text})
 
 prompt = st.chat_input("Ask a question")
 if prompt:
@@ -393,4 +609,5 @@ if prompt:
             except Exception as exc:
                 response_text = f"Error: {exc}"
                 placeholder.markdown(response_text)
+        _try_store_batch_report_from_text(response_text)
         st.session_state.messages.append({"role": "assistant", "content": response_text})
