@@ -1,6 +1,7 @@
 import json
 import os
 import random
+import re
 import time
 import uuid
 from collections import Counter
@@ -122,6 +123,7 @@ def _extract_first_json_object(text: str) -> str:
 
 
 def _escape_invalid_json_backslashes(text: str) -> str:
+    valid_escapes = {'"', "\\", "/", "b", "f", "n", "r", "t", "u"}
     result = []
     in_string = False
     i = 0
@@ -140,7 +142,7 @@ def _escape_invalid_json_backslashes(text: str) -> str:
             continue
         if in_string and ch == "\\":
             next_char = text[i + 1] if i + 1 < len(text) else ""
-            if next_char not in {'"', "\\", "/", "b", "f", "n", "r", "t", "u"}:
+            if next_char not in valid_escapes:
                 result.append("\\\\")
                 i += 1
                 continue
@@ -150,12 +152,9 @@ def _escape_invalid_json_backslashes(text: str) -> str:
 
 
 def _repair_nested_json_string(text: str) -> str:
-    repaired = text.strip()
-    if repaired.startswith('"') and repaired.endswith('"'):
-        repaired = repaired[1:-1]
-    repaired = repaired.replace('\\"', '"')
-    repaired = repaired.replace("\\n", "\n")
-    repaired = repaired.replace("\\t", "\t")
+    repaired = text
+    repaired = re.sub(r'\\\\[ \t\r\n]+(?=")', r"\\\\", repaired)
+    repaired = "".join(ch for ch in repaired if ch >= " " or ch in "\n\r\t")
     return repaired
 
 
