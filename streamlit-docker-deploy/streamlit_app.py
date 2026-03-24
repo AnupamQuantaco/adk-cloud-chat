@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import random
 import re
@@ -19,6 +20,9 @@ from google.cloud import storage
 APP_DIR = Path(__file__).resolve().parent
 LOGO_PATH = str(APP_DIR / "assets" / "Qlogo.jpeg")
 LABEL_PATH = str(APP_DIR / "assets" / "Quantacolabel.jpeg")
+LOGGER = logging.getLogger(__name__)
+if not LOGGER.handlers:
+    logging.basicConfig(level=logging.INFO)
 
 
 def _get_access_token() -> str:
@@ -413,11 +417,12 @@ def _summarize_batch_results(batch_report: dict) -> str:
     file_summaries = batch_report.get("file_summaries", {})
     failures = batch_report.get("failures", [])
     report_gcs_uri = batch_report.get("report_gcs_uri", "")
+    successful_files = set(file_summaries.keys())
     field_counts: Counter[str] = Counter()
     matched_count = 0
     mismatched_count = 0
 
-    for filename in selected_files:
+    for filename in successful_files:
         summary = file_summaries.get(filename, {})
         mismatch_keys = summary.get("potential_mismatch_keys", [])
         if mismatch_keys:
@@ -487,27 +492,67 @@ def _run_batch_comparison(
     requested_count: int,
     random_sample: bool,
     seed: str,
+    debug_mode: bool,
 ) -> dict:
+    LOGGER.info(
+        "Starting batch comparison gs_prefix=%s requested_count=%s random_sample=%s seed=%s",
+        gs_prefix,
+        requested_count,
+        random_sample,
+        seed,
+    )
     reports = {}
     failures = []
     file_summaries = {}
     total = len(selected_uris)
+    selected_files = [os.path.basename(gs_uri) for gs_uri in selected_uris]
+    batch_report = {
+        "gs_prefix": gs_prefix,
+        "requested_count": requested_count,
+        "random_sample": random_sample,
+        "seed": seed,
+        "selected_files": selected_files,
+        "reports": reports,
+        "failures": failures,
+        "file_summaries": file_summaries,
+        "major_mismatch_file_count": 0,
+    }
+
+    st.info(f"Selected files: {', '.join(selected_files)}")
+    LOGGER.info("Selected files: %s", selected_files)
 
     for index, gs_uri in enumerate(selected_uris, start=1):
         filename = os.path.basename(gs_uri)
+        LOGGER.info("Processing file %s (%s/%s)", filename, index, total)
+        st.info(f"Processing {index}/{total}: {filename}")
         placeholder.markdown(f"Processing {index}/{total}: `{filename}`")
         prompt = _build_single_file_prompt(gs_uri, filename, url_1, url_2)
         final_text = ""
         try:
             final_text = _query_text(engine, prompt, user_id)
+            LOGGER.info(
+                "Received engine response filename=%s response_length=%s",
+                filename,
+                len(final_text),
+            )
+            st.info(f"{filename}: engine response length {len(final_text)}")
+            if not final_text.strip():
+                raise ValueError("Empty engine response")
             parsed = _parse_json_response(final_text)
+            LOGGER.info("JSON parse succeeded filename=%s", filename)
+            st.info(f"{filename}: JSON parse succeeded")
             normalized = _normalize_invoice_report(parsed)
+            LOGGER.info("Normalization succeeded filename=%s", filename)
+            st.info(f"{filename}: normalization succeeded")
             reports[filename] = normalized
             file_summaries[filename] = _build_file_summary(normalized)
+            LOGGER.info("File summary built filename=%s", filename)
+            st.info(f"{filename}: file summary built")
         except Exception as exc:
             error_text = str(exc)
             if "compare_invoices_gcs" in final_text and "unavailable" in final_text.lower():
                 error_text = f"wrong-engine usage: {error_text}"
+            LOGGER.exception("Batch file processing failed filename=%s", filename)
             failure = {
                 "filename": filename,
                 "error": error_text,
@@ -517,25 +562,26 @@ def _run_batch_comparison(
             if isinstance(parsed_outer, dict):
                 failure["parsed_outer_payload"] = parsed_outer
             failures.append(failure)
+            st.warning(f"{filename}: {error_text}")
+            if debug_mode and final_text:
+                st.warning(f"{filename} raw response preview: {final_text[:500]}")
+
     major_mismatch_file_count = sum(
         1
         for summary in file_summaries.values()
         if summary.get("major_mismatch_count", 0) > 0
     )
-    batch_report = {
-        "gs_prefix": gs_prefix,
-        "requested_count": requested_count,
-        "random_sample": random_sample,
-        "seed": seed,
-        "selected_files": [os.path.basename(gs_uri) for gs_uri in selected_uris],
-        "reports": reports,
-        "failures": failures,
-        "file_summaries": file_summaries,
-        "major_mismatch_file_count": major_mismatch_file_count,
-    }
-    batch_report["report_gcs_uri"] = _write_json_to_gcs(
-        batch_report, bucket_name="invoice-comparison", prefix="reports"
-    )
+    batch_report["major_mismatch_file_count"] = major_mismatch_file_count
+    try:
+        batch_report["report_gcs_uri"] = _write_json_to_gcs(
+            batch_report, bucket_name="invoice-comparison", prefix="reports"
+        )
+        LOGGER.info("Batch report write succeeded report_gcs_uri=%s", batch_report["report_gcs_uri"])
+        st.info(f"Saved report URI: {batch_report['report_gcs_uri']}")
+    except Exception as exc:
+        batch_report["report_write_error"] = str(exc)
+        LOGGER.exception("Batch report write failed")
+        st.error(f"Failed to write batch report to GCS: {exc}")
     return batch_report
 
 
@@ -577,6 +623,7 @@ with st.sidebar:
     batch_count = st.number_input("Batch file count", min_value=1, max_value=50, value=5)
     batch_random = st.checkbox("Random sample", value=True)
     batch_seed = st.text_input("Random seed (optional)", value="")
+    debug_mode = st.checkbox("Debug mode", value=False)
     url_1 = st.text_input(
         "Extractor URL 1",
         value=os.getenv(
@@ -667,9 +714,18 @@ if run_batch:
                         int(batch_count),
                         batch_random,
                         batch_seed.strip(),
+                        debug_mode,
                     )
                     summary = _summarize_batch_results(batch_report)
-                    _store_batch_report(batch_report, summary_text=summary)
+                    if batch_report.get("file_summaries"):
+                        _store_batch_report(batch_report, summary_text=summary)
+                    if not batch_report.get("file_summaries"):
+                        st.error("Batch run failed: no files were successfully processed.")
+                    if batch_report.get("report_write_error"):
+                        st.error(
+                            "Partial batch result available, but report write failed: "
+                            f"{batch_report['report_write_error']}"
+                        )
                     placeholder.markdown(summary)
             except requests.HTTPError as exc:
                 summary = f"HTTP error: {exc}"
