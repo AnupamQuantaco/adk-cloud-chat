@@ -381,6 +381,12 @@ def _write_json_to_gcs(payload: dict, bucket_name: str, prefix: str) -> str:
     return f"gs://{bucket_name}/{object_name}"
 
 
+def _save_batch_report_to_gcs(results: dict) -> str:
+    return _write_json_to_gcs(
+        results, bucket_name="invoice-comparison", prefix="reports"
+    )
+
+
 def _store_batch_report(
     payload: dict,
     selected_files_hint: Optional[list[str]] = None,
@@ -501,31 +507,50 @@ def _run_batch_comparison(
         random_sample,
         seed,
     )
-    total = len(selected_uris)
-    selected_files = [os.path.basename(gs_uri) for gs_uri in selected_uris]
-    results = {
-        "gs_prefix": gs_prefix,
-        "requested_count": requested_count,
-        "random_sample": random_sample,
-        "seed": seed,
-        "selected_files": selected_files,
-        "reports": {},
-        "failures": [],
-        "file_summaries": {},
-        "major_mismatch_file_count": 0,
-    }
+    results = {}
+    try:
+        total = len(selected_uris)
+        selected_files = [os.path.basename(gs_uri) for gs_uri in selected_uris]
+        results = {
+            "gs_prefix": gs_prefix,
+            "requested_count": requested_count,
+            "random_sample": random_sample,
+            "seed": seed,
+            "selected_files": selected_files,
+            "reports": {},
+            "failures": [],
+            "file_summaries": {},
+            "major_mismatch_file_count": 0,
+        }
+        st.info(f"Selected files: {', '.join(selected_files)}")
+        LOGGER.info("Selected files: %s", selected_files)
+    except Exception as exc:
+        LOGGER.exception("Batch setup failed")
+        st.error(f"Batch setup failed: {exc}")
+        return {
+            "gs_prefix": gs_prefix,
+            "requested_count": requested_count,
+            "random_sample": random_sample,
+            "seed": seed,
+            "selected_files": [],
+            "reports": {},
+            "failures": [{"filename": "batch_setup", "error": str(exc), "raw_response": None}],
+            "file_summaries": {},
+            "major_mismatch_file_count": 0,
+        }
 
-    st.info(f"Selected files: {', '.join(selected_files)}")
-    LOGGER.info("Selected files: %s", selected_files)
-
-    for index, filename in enumerate(selected_files, start=1):
-        gs_uri = selected_uris[index - 1]
-        LOGGER.info("Processing file %s (%s/%s)", filename, index, total)
-        st.info(f"Processing {index}/{total}: {filename}")
-        placeholder.markdown(f"Processing {index}/{total}: `{filename}`")
-        prompt = _build_single_file_prompt(gs_uri, filename, url_1, url_2)
+    for index, filename in enumerate(results["selected_files"], start=1):
         raw_text = None
+        parsed = None
+        normalized = None
+
         try:
+            gs_uri = selected_uris[index - 1]
+            LOGGER.info("Processing file %s (%s/%s)", filename, index, len(results["selected_files"]))
+            st.info(f"Processing file {index}/{len(results['selected_files'])}: {filename}")
+            placeholder.markdown(f"Processing {index}/{len(results['selected_files'])}: `{filename}`")
+
+            prompt = _build_single_file_prompt(gs_uri, filename, url_1, url_2)
             raw_text = _query_text(engine, prompt, user_id)
             LOGGER.info(
                 "Received engine response filename=%s response_length=%s",
@@ -535,50 +560,61 @@ def _run_batch_comparison(
             st.info(f"{filename}: engine response length {len(raw_text)}")
             if not raw_text.strip():
                 raise ValueError("Empty engine response")
+
             parsed = _parse_json_response(raw_text)
             LOGGER.info("JSON parse succeeded filename=%s", filename)
             st.info(f"{filename}: JSON parse succeeded")
+
             normalized = _normalize_invoice_report(parsed)
             LOGGER.info("Normalization succeeded filename=%s", filename)
             st.info(f"{filename}: normalization succeeded")
+
             results["reports"][filename] = normalized
             results["file_summaries"][filename] = _build_file_summary(normalized)
             LOGGER.info("File summary built filename=%s", filename)
             st.info(f"{filename}: file summary built")
+            st.session_state["last_batch_result_json"] = results
+
         except Exception as exc:
             error_text = str(exc)
             if raw_text and "compare_invoices_gcs" in raw_text and "unavailable" in raw_text.lower():
                 error_text = f"wrong-engine usage: {error_text}"
             LOGGER.exception("Batch file processing failed filename=%s", filename)
-            failure = {
-                "filename": filename,
-                "error": error_text,
-                "raw_response": raw_text,
-            }
-            parsed_outer = _try_parse_json_response(raw_text) if raw_text else None
-            if isinstance(parsed_outer, dict):
-                failure["parsed_outer_payload"] = parsed_outer
-            results["failures"].append(failure)
-            st.warning(f"{filename}: {error_text}")
+            results["failures"].append(
+                {
+                    "filename": filename,
+                    "error": error_text,
+                    "raw_response": raw_text,
+                    "parsed_preview": parsed if isinstance(parsed, dict) else None,
+                }
+            )
+            st.warning(f"Failed for {filename}: {error_text}")
             if debug_mode and raw_text:
                 st.warning(f"{filename} raw response preview: {raw_text[:500]}")
+            st.session_state["last_batch_result_json"] = results
             continue
 
-    results["major_mismatch_file_count"] = sum(
-        1
-        for summary in results["file_summaries"].values()
-        if isinstance(summary, dict) and summary.get("major_mismatch_count", 0) > 0
-    )
     try:
-        results["report_gcs_uri"] = _write_json_to_gcs(
-            results, bucket_name="invoice-comparison", prefix="reports"
+        results["major_mismatch_file_count"] = sum(
+            1
+            for summary in results["file_summaries"].values()
+            if isinstance(summary, dict) and summary.get("major_mismatch_count", 0) > 0
         )
-        LOGGER.info("Batch report write succeeded report_gcs_uri=%s", results["report_gcs_uri"])
-        st.info(f"Saved report URI: {results['report_gcs_uri']}")
+    except Exception as exc:
+        LOGGER.exception("Final batch aggregation failed")
+        results["aggregation_error"] = str(exc)
+        st.error(f"Batch aggregation failed: {exc}")
+
+    try:
+        report_gcs_uri = _save_batch_report_to_gcs(results)
+        results["report_gcs_uri"] = report_gcs_uri
+        st.session_state["last_batch_report_gcs_uri"] = report_gcs_uri
+        LOGGER.info("Batch report write succeeded report_gcs_uri=%s", report_gcs_uri)
+        st.success(report_gcs_uri)
     except Exception as exc:
         results["report_write_error"] = str(exc)
         LOGGER.exception("Batch report write failed")
-        st.error(f"Failed to write batch report to GCS: {exc}")
+        st.error(f"Failed to save batch report: {exc}")
     return results
 
 
